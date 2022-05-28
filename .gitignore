@@ -34,3 +34,6 @@ override.tf.json
 .terraformrc
 terraform.rc
 .dccache
+.env
+node_modules
+package-lock.json
