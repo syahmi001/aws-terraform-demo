@@ -37,3 +37,4 @@ terraform.rc
 .env
 node_modules
 package-lock.json
+gitea-deploy.pem
