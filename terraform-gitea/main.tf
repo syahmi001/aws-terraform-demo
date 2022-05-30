@@ -24,26 +24,45 @@ resource "aws_default_vpc" "default_vpc" {
 resource "aws_default_subnet" "default_subnet_a" {
   availability_zone = "ap-southeast-1a"
 }
-
 resource "aws_default_subnet" "default_subnet_b" {
   availability_zone = "ap-southeast-1b"
 }
 
-# Private key for SSH
-# resource "tls_private_key" "key" {
-#   algorithm   = "RSA"
-#   ecdsa_curve = "P256"
-# }
-# resource "aws_key_pair" "key" {
-#   public_key = tls_private_key.key.public_key_openssh
-# }
+# Create AWS security group for EC2 Instance
+resource "aws_security_group" "gitea" {
+  name        = "gitea"
+  description = "Allow ssh  inbound traffic"
+
+  ingress {
+    from_port   = 22
+    to_port     = 22
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  ingress {
+    from_port   = 80
+    to_port     = 80
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+
+  }
+}
 
 # Gitea EC2 Instance
 resource "aws_instance" "host" {
-  ami                         = "ami-0bd6906508e74f692"
-  instance_type               = "t2.micro"
-  key_name                    = "gitea-deploy"
-  user_data                   = <<HEREDOC
+  ami                    = "ami-0bd6906508e74f692"
+  instance_type          = "t2.micro"
+  key_name               = "gitea-deploy"
+  vpc_security_group_ids = ["${aws_security_group.gitea.id}"]
+  user_data              = <<HEREDOC
   #!/bin/bash
   sudo yum update -y
   sudo amazon-linux-extras install docker
@@ -52,10 +71,19 @@ resource "aws_instance" "host" {
   sudo curl -L "https://github.com/docker/compose/releases/download/1.23.2/docker-compose-$(uname -s)-$(uname -m)" -o /usr/local/bin/docker-compose
   sudo chmod +x /usr/local/bin/docker-compose
 HEREDOC
+
   associate_public_ip_address = true
+
+  # Running remote execution script
+  connection {
+    type        = "ssh"
+    host        = aws_instance.host.public_ip
+    user        = "ec2-user"
+    private_key = file("gitea-deploy.pem")
+    timeout     = "2m"
+  }
   provisioner "remote-exec" {
     inline = [
-      "cloud-init status --wait",
       "mkdir ~/gitea",
     ]
   }
@@ -70,13 +98,6 @@ HEREDOC
     ]
   }
 
-  # connection {
-  #   host        = aws_instance.host.public_ip
-  #   type        = "ssh"
-  #   user        = "ec2-user"
-  #   private_key = "gitea-deploy"
-  #   timeout     = "2m"
-  # }
 
   tags = {
     Name = var.instance_name
@@ -84,24 +105,32 @@ HEREDOC
 }
 
 # ALB Load Balancer
-resource "aws_alb" "application_load_balancer" {
-  name               = var.alb_name # Naming our load balancer
+resource "aws_lb" "application_load_balancer" {
+  name               = var.lb_name # Naming our load balancer
+  internal           = false
   load_balancer_type = "application"
+  # Referencing the security group
+  security_groups = ["${aws_security_group.load_balancer_security_group.id}"]
   subnets = [ # Referencing the default subnets
     "${aws_default_subnet.default_subnet_a.id}",
     "${aws_default_subnet.default_subnet_b.id}"
   ]
-  # Referencing the security group
-  security_groups = ["${aws_security_group.load_balancer_security_group.id}"]
 }
 
 # Creating a security group for the load balancer:
 resource "aws_security_group" "load_balancer_security_group" {
   ingress {
-    from_port   = 3000 # Allowing traffic in from port 3000
-    to_port     = 3000
+    from_port   = 443 # Allowing traffic in from port 443
+    to_port     = 443
     protocol    = "tcp"
     cidr_blocks = ["0.0.0.0/0"] # Allowing traffic in from all sources
+  }
+
+  ingress {
+    from_port   = 80
+    to_port     = 80
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
   }
 
   egress {
@@ -113,23 +142,39 @@ resource "aws_security_group" "load_balancer_security_group" {
 }
 
 resource "aws_lb_target_group" "target_group" {
-  name        = "target-group"
-  port        = 3000
-  protocol    = "HTTP"
-  target_type = "instance"
-  vpc_id      = aws_default_vpc.default_vpc.id # Referencing the default VPC
-  health_check {
-    matcher = "200,301,302"
-    path    = "/"
-  }
+  name     = "target-group"
+  port     = 80
+  protocol = "HTTP"
+  vpc_id   = aws_default_vpc.default_vpc.id # Referencing the default VPC
 }
 
+# HTTPS request handler
 resource "aws_lb_listener" "listener" {
-  load_balancer_arn = aws_alb.application_load_balancer.arn # Referencing our load balancer
-  port              = "3000"
+  load_balancer_arn = aws_lb.application_load_balancer.arn # Referencing our load balancer
+  port              = "443"
   protocol          = "HTTPS"
+  ssl_policy        = "ELBSecurityPolicy-2016-08"
+  certificate_arn   = var.ssl-arn
+
   default_action {
     type             = "forward"
     target_group_arn = aws_lb_target_group.target_group.arn # Referencing our target group
+  }
+}
+
+# Redirect any HTTP request to HTTPS
+resource "aws_lb_listener" "listener" {
+  load_balancer_arn = aws_lb.application_load_balancer.arn # Referencing our load balancer
+  port              = "80"
+  protocol          = "HTTP"
+
+  default_action {
+    type = "redirect"
+
+    redirect {
+      port        = "443"
+      protocol    = "HTTPS"
+      status_code = "HTTP_301"
+    }
   }
 }
